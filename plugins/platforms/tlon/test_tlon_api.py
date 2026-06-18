@@ -516,7 +516,84 @@ class TlonSSEClientTests(unittest.TestCase):
         self.assertEqual(session.get_calls[0]["timeout"].total, 30)
 
 
+class FakeDmSendClient:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.authenticated = False
+        self.opened = False
+        self.closed = False
+        self.pokes = []
+
+    async def authenticate(self):
+        self.authenticated = True
+        return "urbauth=fake"
+
+    async def open(self):
+        self.opened = True
+
+    async def poke(self, app, mark, json_payload):
+        self.pokes.append((app, mark, json_payload))
+        return len(self.pokes)
+
+    async def close(self):
+        self.closed = True
+
+
 class TlonCLITests(unittest.TestCase):
+    def test_send_message_to_dm_uses_chat_dm_action_2_http_poke(self):
+        fake_clients = []
+        cfg = tlon_api.TlonConfig.from_env(
+            env={
+                "TLON_NODE_URL": "https://zod.tlon.network",
+                "TLON_NODE_ID": "~zod",
+                "TLON_ACCESS_CODE": "code",
+                "TLON_CLI": "tlon-test",
+            }
+        )
+
+        def client_factory(client_cfg):
+            client = FakeDmSendClient(client_cfg)
+            fake_clients.append(client)
+            return client
+
+        async def run():
+            cli = tlon_api.TlonCLI(cfg, client_factory=client_factory)
+            with patch.object(tlon_api.time, "time", return_value=1781770387.0):
+                return await cli.send_message("~nec", "hello from gateway")
+
+        result = asyncio.run(run())
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.command, ("http", "chat-dm-action-2", "~nec"))
+        self.assertEqual(result.message_id, "~zod/170.141.217.343.014.495.060.927.377.582.325.760")
+        self.assertEqual(len(fake_clients), 1)
+        client = fake_clients[0]
+        self.assertTrue(client.authenticated)
+        self.assertTrue(client.opened)
+        self.assertTrue(client.closed)
+        self.assertEqual(len(client.pokes), 1)
+        app, mark, payload = client.pokes[0]
+        self.assertEqual(app, "chat")
+        self.assertEqual(mark, "chat-dm-action-2")
+        self.assertEqual(payload["ship"], "~nec")
+        self.assertEqual(payload["diff"]["id"], result.message_id)
+        self.assertEqual(
+            payload["diff"]["delta"],
+            {
+                "add": {
+                    "essay": {
+                        "content": [{"inline": ["hello from gateway"]}],
+                        "sent": 1781770387000,
+                        "author": "~zod",
+                        "kind": "/chat",
+                        "meta": None,
+                        "blob": None,
+                    },
+                    "time": None,
+                }
+            },
+        )
+
     def test_send_and_reply_use_tlon_cli(self):
         calls = []
         cfg = tlon_api.TlonConfig.from_env(

@@ -145,9 +145,23 @@ def _parse_non_negative_int(value: Any, default: int) -> int:
     return parsed if parsed >= 0 else default
 
 
+DA_UNIX_EPOCH = 170141184475152167957503069145530368
+
+
 def _format_da_from_unix_millis(value: float) -> str:
     dt = datetime.fromtimestamp(value / 1000.0, tz=timezone.utc)
     return f"~{dt.year}.{dt.month}.{dt.day}..{dt.hour:02d}.{dt.minute:02d}.{dt.second:02d}"
+
+
+def _format_urbit_da_decimal_from_unix_millis(value: int) -> str:
+    """Return the dotted decimal @da format Tlon v2 writ IDs use."""
+    da_value = DA_UNIX_EPOCH + (int(value) * (1 << 64)) // 1000
+    text = str(da_value)
+    parts: list[str] = []
+    while text:
+        parts.append(text[-3:])
+        text = text[:-3]
+    return ".".join(reversed(parts))
 
 
 def _format_dr_seconds(seconds: int) -> str:
@@ -629,13 +643,64 @@ class TlonCLI:
         *,
         runner: CommandRunner | None = None,
         observer: CliObserver | None = None,
+        client_factory: Callable[[TlonConfig], Any] | None = None,
     ) -> None:
         self.config = config
         self._runner = runner or self._run_subprocess
         self._observer = observer
+        self._client_factory = client_factory or TlonSSEClient
 
     async def send_message(self, chat_id: str, text: str) -> TlonSendResult:
+        normalized = normalize_ship(chat_id)
+        if normalized == str(chat_id or "").strip() and normalized.startswith("~"):
+            return await self._send_dm_message(normalized, text)
         return await self._run(("posts", "send", chat_id, text))
+
+    async def _send_dm_message(self, chat_id: str, text: str) -> TlonSendResult:
+        sent_at = int(time.time() * 1000)
+        message_id = f"{self.config.ship_name}/{_format_urbit_da_decimal_from_unix_millis(sent_at)}"
+        payload = {
+            "ship": chat_id,
+            "diff": {
+                "id": message_id,
+                "delta": {
+                    "add": {
+                        "essay": {
+                            "content": [{"inline": [text]}],
+                            "sent": sent_at,
+                            "author": self.config.ship_name,
+                            "kind": "/chat",
+                            "meta": None,
+                            "blob": None,
+                        },
+                        "time": None,
+                    }
+                },
+            },
+        }
+        command = ("http", "chat-dm-action-2", chat_id)
+        client = self._client_factory(self.config)
+        try:
+            await client.authenticate()
+            await client.open()
+            await client.poke("chat", "chat-dm-action-2", payload)
+        except Exception as exc:
+            return TlonSendResult(
+                success=False,
+                command=command,
+                returncode=1,
+                error=f"Tlon DM send failed: {exc}",
+            )
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+        return TlonSendResult(
+            success=True,
+            command=command,
+            message_id=message_id,
+        )
 
     async def send_reply(
         self,
