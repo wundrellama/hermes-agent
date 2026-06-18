@@ -28,6 +28,8 @@ DEFAULT_GATEWAY_LEASE_SECONDS = 90.0
 DEFAULT_GATEWAY_ACTIVE_WINDOW_SECONDS = 300
 DEFAULT_GATEWAY_OFFLINE_REPLY_COOLDOWN_SECONDS = 300
 DEFAULT_SSE_READ_TIMEOUT_SECONDS = 60.0
+DEFAULT_CHANNEL_CATCHUP_INTERVAL_SECONDS = 15.0
+DEFAULT_CHANNEL_CATCHUP_HISTORY_COUNT = 10
 DEFAULT_MAX_CONSECUTIVE_BOT_RESPONSES = 2
 DEFAULT_CONTEXT_MESSAGES = 20
 
@@ -206,6 +208,8 @@ class TlonConfig:
     gateway_status_active_window_seconds: int = DEFAULT_GATEWAY_ACTIVE_WINDOW_SECONDS
     gateway_status_reply_cooldown_seconds: int = DEFAULT_GATEWAY_OFFLINE_REPLY_COOLDOWN_SECONDS
     sse_read_timeout_seconds: float = DEFAULT_SSE_READ_TIMEOUT_SECONDS
+    channel_catchup_interval_seconds: float = DEFAULT_CHANNEL_CATCHUP_INTERVAL_SECONDS
+    channel_catchup_history_count: int = DEFAULT_CHANNEL_CATCHUP_HISTORY_COUNT
     # Force the hosted (memex) image-upload path. Opt-in: only true when the
     # operator sets TLON_HOSTING. Read once where the env is reliably present
     # (the adapter at startup) and carried via this field into CLI invocations,
@@ -494,6 +498,26 @@ class TlonConfig:
             ),
             DEFAULT_SSE_READ_TIMEOUT_SECONDS,
         )
+        channel_catchup_interval_seconds = _parse_float(
+            _env_or_extra(
+                env,
+                ("TLON_CHANNEL_CATCHUP_INTERVAL_SECONDS",),
+                extra,
+                ("channel_catchup_interval_seconds", "channel_catchup_interval"),
+                DEFAULT_CHANNEL_CATCHUP_INTERVAL_SECONDS,
+            ),
+            DEFAULT_CHANNEL_CATCHUP_INTERVAL_SECONDS,
+        )
+        channel_catchup_history_count = _parse_non_negative_int(
+            _env_or_extra(
+                env,
+                ("TLON_CHANNEL_CATCHUP_HISTORY_COUNT",),
+                extra,
+                ("channel_catchup_history_count", "channel_catchup_count"),
+                DEFAULT_CHANNEL_CATCHUP_HISTORY_COUNT,
+            ),
+            DEFAULT_CHANNEL_CATCHUP_HISTORY_COUNT,
+        )
 
         auto_discover = parse_bool(
             _env_or_extra(env, ("TLON_AUTO_DISCOVER",), extra, ("auto_discover",))
@@ -545,6 +569,8 @@ class TlonConfig:
             gateway_status_active_window_seconds=gateway_status_active_window_seconds,
             gateway_status_reply_cooldown_seconds=gateway_status_reply_cooldown_seconds,
             sse_read_timeout_seconds=sse_read_timeout_seconds,
+            channel_catchup_interval_seconds=channel_catchup_interval_seconds,
+            channel_catchup_history_count=channel_catchup_history_count,
         )
 
     def is_complete(self) -> bool:
@@ -651,10 +677,58 @@ class TlonCLI:
         self._client_factory = client_factory or TlonSSEClient
 
     async def send_message(self, chat_id: str, text: str) -> TlonSendResult:
-        normalized = normalize_ship(chat_id)
-        if normalized == str(chat_id or "").strip() and normalized.startswith("~"):
+        target = str(chat_id or "").strip()
+        normalized = normalize_ship(target)
+        if normalized == target and normalized.startswith("~"):
             return await self._send_dm_message(normalized, text)
+        nest = parse_channel_nest(target)
+        if nest is not None and nest.get("type") == "chat":
+            return await self._send_chat_channel_message(target, text)
         return await self._run(("posts", "send", chat_id, text))
+
+    async def _send_chat_channel_message(self, chat_id: str, text: str) -> TlonSendResult:
+        sent_at = int(time.time() * 1000)
+        message_id = _format_urbit_da_decimal_from_unix_millis(sent_at)
+        payload = {
+            "channel": {
+                "nest": chat_id,
+                "action": {
+                    "post": {
+                        "add": {
+                            "content": [{"inline": [text]}],
+                            "sent": sent_at,
+                            "author": self.config.ship_name,
+                            "kind": "/chat",
+                            "meta": None,
+                            "blob": None,
+                        }
+                    }
+                },
+            }
+        }
+        command = ("http", "channel-action-2", chat_id)
+        client = self._client_factory(self.config)
+        try:
+            await client.authenticate()
+            await client.open()
+            await client.poke("channels", "channel-action-2", payload)
+        except Exception as exc:
+            return TlonSendResult(
+                success=False,
+                command=command,
+                returncode=1,
+                error=f"Tlon channel send failed: {exc}",
+            )
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+        return TlonSendResult(
+            success=True,
+            command=command,
+            message_id=message_id,
+        )
 
     async def _send_dm_message(self, chat_id: str, text: str) -> TlonSendResult:
         sent_at = int(time.time() * 1000)

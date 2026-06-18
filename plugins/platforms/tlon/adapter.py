@@ -325,6 +325,8 @@ class TlonAdapter(BasePlatformAdapter):
         self._connected_at = 0.0
         self._sse: Optional[TlonSSEClient] = None
         self._stream_task: Optional[asyncio.Task] = None
+        self._channel_catchup_task: Optional[asyncio.Task] = None
+        self._channel_catchup_seeded = False
         self._gateway_status = TlonGatewayStatus(
             self.tlon_config,
             on_error=lambda operation, exc: self._telemetry.error(
@@ -340,6 +342,9 @@ class TlonAdapter(BasePlatformAdapter):
         self._seen_ids: set[str] = set()
         self._seen_order: list[str] = []
         self._monitored_channels = set(self.tlon_config.channels)
+        home_channel = (self.tlon_config.home_channel or "").strip()
+        if home_channel and not _is_dm_chat_id(home_channel):
+            self._monitored_channels.add(home_channel)
         self._mention_matcher = self._build_mention_matcher()
         self._participated_threads: set[str] = set()
         self._known_bot_consecutive_by_channel: dict[str, int] = {}
@@ -391,11 +396,15 @@ class TlonAdapter(BasePlatformAdapter):
             await self._process_pending_dm_invites()
             await self._process_pending_group_invites()
             await self._start_gateway_status()
-            self._stream_task = asyncio.create_task(self._run_stream())
             self._computing_presence.bind_loop(asyncio.get_running_loop())
             set_active_computing_presence_tracker(self._computing_presence)
             self._mark_connected()
             self._connected_at = time.monotonic()
+            self._stream_task = asyncio.create_task(self._run_stream())
+            if self.tlon_config.channel_catchup_interval_seconds > 0:
+                self._channel_catchup_task = asyncio.create_task(
+                    self._run_channel_catchup_loop()
+                )
             self._telemetry.gateway_connected(
                 {
                     "source": source,
@@ -434,6 +443,13 @@ class TlonAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._stream_task = None
+        if self._channel_catchup_task is not None:
+            self._channel_catchup_task.cancel()
+            try:
+                await self._channel_catchup_task
+            except asyncio.CancelledError:
+                pass
+            self._channel_catchup_task = None
         await self._close_sse()
         self._seen_ids.clear()
         self._seen_order.clear()
@@ -441,6 +457,7 @@ class TlonAdapter(BasePlatformAdapter):
         self._known_bot_consecutive_by_channel.clear()
         self._processed_dm_invites.clear()
         self._processed_group_invites.clear()
+        self._channel_catchup_seeded = False
         self._telemetry.flush()
 
     def _build_mention_matcher(self, *, nickname: str = "") -> BotMentionMatcher:
@@ -452,15 +469,23 @@ class TlonAdapter(BasePlatformAdapter):
             )
         )
 
+    def _home_owner_listen_channels(self) -> set[str]:
+        home = (self.tlon_config.home_channel or "").strip()
+        if home and not _is_dm_chat_id(home):
+            return canonical_nest_set([home])
+        return set()
+
     def _owner_listen_env_defaults(self) -> OwnerListenState:
+        enabled_channels = canonical_nest_set(
+            self.tlon_config.owner_listen_enabled_channels
+        )
+        enabled_channels.update(self._home_owner_listen_channels())
         return OwnerListenState(
             enabled=self.tlon_config.owner_listen,
             disabled_channels=canonical_nest_set(
                 self.tlon_config.owner_listen_disabled_channels
             ),
-            enabled_channels=canonical_nest_set(
-                self.tlon_config.owner_listen_enabled_channels
-            ),
+            enabled_channels=enabled_channels,
             default_all=self.tlon_config.owner_listen_default == "all",
         )
 
@@ -490,6 +515,10 @@ class TlonAdapter(BasePlatformAdapter):
             return
         bucket = parse_settings_bucket(payload)
         self._owner_listen = owner_listen_state_from_settings(bucket, defaults=defaults)
+        # Home-channel semantics should not depend on who hosts the group. Even
+        # if the settings store has an explicit empty enabled-channel list, the
+        # configured home channel remains owner-listen enabled for the owner.
+        self._owner_listen.enabled_channels.update(self._home_owner_listen_channels())
         new_group_channels = settings_group_channels(bucket)
         removed_group_channels = (
             self._settings_group_channels
@@ -1330,6 +1359,108 @@ class TlonAdapter(BasePlatformAdapter):
             finally:
                 self._sse = None
 
+    def _channel_catchup_nests(self) -> list[str]:
+        """Channels whose materialized history should reconcile missed SSE events."""
+        nests = set(self._monitored_channels)
+        home = (self.tlon_config.home_channel or "").strip()
+        if home and not _is_dm_chat_id(home):
+            nests.add(home)
+        return sorted(
+            nest
+            for nest in nests
+            if isinstance(nest, str)
+            and nest.split("/", 1)[0] in ("chat", "heap", "diary")
+        )
+
+    async def _run_channel_catchup_loop(self) -> None:
+        interval = max(1.0, float(self.tlon_config.channel_catchup_interval_seconds))
+        while self._running:
+            try:
+                seed_only = not self._channel_catchup_seeded
+                await self._catch_up_channels_once(seed_only=seed_only)
+                self._channel_catchup_seeded = True
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.debug("[tlon] channel catch-up poll failed: %s", exc)
+                self._telemetry.error("channel_catchup", exc, operation="poll")
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+
+    async def _catch_up_channels_once(self, *, seed_only: bool = False) -> None:
+        if self._sse is None:
+            return
+        count = int(self.tlon_config.channel_catchup_history_count)
+        if count <= 0:
+            return
+        for nest in self._channel_catchup_nests():
+            if not self._running and self._stream_task is not None:
+                return
+            try:
+                entries = await fetch_channel_history(self._sse.scry, nest, count)
+            except Exception as exc:
+                logger.debug("[tlon] channel catch-up failed for %s: %s", nest, exc)
+                self._telemetry.error("channel_catchup", exc, operation="fetch", channel=nest)
+                continue
+            dispatched = 0
+            seeded = 0
+            for entry in entries:
+                message = self._message_from_history_entry(nest, entry)
+                if message is None:
+                    continue
+                if seed_only:
+                    if self._mark_seen(message):
+                        seeded += 1
+                    continue
+                before = len(self._seen_ids)
+                await self._process_channel_message(message)
+                if len(self._seen_ids) > before:
+                    dispatched += 1
+            if seed_only and seeded:
+                logger.info(
+                    "[tlon] channel catch-up seeded %d existing post(s) from %s",
+                    seeded,
+                    nest,
+                )
+            elif dispatched:
+                logger.info(
+                    "[tlon] channel catch-up dispatched %d missed post(s) from %s",
+                    dispatched,
+                    nest,
+                )
+
+    def _message_from_history_entry(
+        self,
+        nest: str,
+        entry: Any,
+    ) -> Optional[TlonIncomingMessage]:
+        author = normalize_ship(getattr(entry, "author", ""))
+        text = str(getattr(entry, "content", "") or "").strip()
+        post_id = str(getattr(entry, "post_id", "") or "")
+        if not author or author == self.tlon_config.ship_name or not text or not post_id:
+            return None
+        try:
+            sent_at = datetime.fromtimestamp(
+                float(getattr(entry, "timestamp", 0.0) or 0.0) / 1000.0,
+                tz=timezone.utc,
+            )
+        except (TypeError, ValueError, OSError, OverflowError):
+            sent_at = datetime.now(timezone.utc)
+        return TlonIncomingMessage(
+            chat_id=nest,
+            chat_name=nest.rsplit("/", 1)[-1],
+            chat_type="group",
+            user_id=author,
+            user_name=author,
+            text=text,
+            message_id=post_id,
+            reply_to_message_id=None,
+            sent_at=sent_at,
+            raw={"source": "channel-catchup", "nest": nest, "post_id": post_id},
+        )
+
     async def _run_stream(self) -> None:
         backoff_idx = 0
         while self._running:
@@ -1394,7 +1525,9 @@ class TlonAdapter(BasePlatformAdapter):
         message = parse_channel_message(raw, self_ship=self.tlon_config.ship_name)
         if message is None:
             return
+        await self._process_channel_message(message)
 
+    async def _process_channel_message(self, message: TlonIncomingMessage) -> None:
         is_mentioned = self._mention_matcher.mentioned(message.text)
         clean_text = (
             self._mention_matcher.strip_leading(message.text)
@@ -1440,7 +1573,16 @@ class TlonAdapter(BasePlatformAdapter):
             return
         if not self._passes_group_loop_safety(message):
             return
-        dispatch_text = await self._with_group_context(message, clean_text, decision.reason)
+        if clean_text.startswith("/"):
+            # Gateway slash commands (/new, /model, /status, ...) must reach the
+            # gateway command router as the first token. Context wrapping turns
+            # them into ordinary model input and the model just roleplays the
+            # command instead of executing it.
+            dispatch_text = clean_text
+        else:
+            dispatch_text = await self._with_group_context(
+                message, clean_text, decision.reason
+            )
         await self._dispatch_message(
             replace(message, text=dispatch_text),
             is_dm=False,

@@ -511,6 +511,136 @@ class AdapterAttentionTests(unittest.TestCase):
             {"chat_id": "chat/~pen/home", "name": "chat/~pen/home"},
         )
 
+    def test_channel_history_catchup_dispatches_home_channel_once(self):
+        adapter = self.make_adapter(
+            {
+                "channels": [],
+                "home_channel": "chat/~labbel/home",
+                "owner_ship": "~mug",
+            }
+        )
+        adapter._sse = FakeSSE(
+            payload={
+                "posts": {
+                    "170142": {
+                        "r-post": {
+                            "set": {
+                                "essay": {
+                                    "author": "~mug",
+                                    "sent": 1000,
+                                    "content": [{"inline": ["catch me"]}],
+                                },
+                                "seal": {"id": "170142"},
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        events = []
+
+        async def record(event):
+            events.append(event)
+
+        adapter.handle_message = record
+        asyncio.run(adapter._catch_up_channels_once())
+        asyncio.run(adapter._catch_up_channels_once())
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].source.chat_id, "chat/~labbel/home")
+        self.assertEqual(events[0].text, "catch me")
+
+    def test_settings_load_preserves_home_channel_owner_listen(self):
+        adapter = self.make_adapter(
+            {
+                "channels": [],
+                "home_channel": "chat/~labbel/home",
+                "owner_ship": "~mug",
+            }
+        )
+        adapter._sse = FakeSSE(
+            payload={
+                "all": {
+                    "moltbot": {
+                        "tlon": {
+                            "ownerListenEnabledChannels": [],
+                        }
+                    }
+                }
+            }
+        )
+
+        asyncio.run(adapter._load_settings_state())
+        events = asyncio.run(
+            self.dispatches(
+                adapter,
+                channel_event(
+                    "home, no mention",
+                    author="~mug",
+                    nest="chat/~labbel/home",
+                    post_id="170143",
+                ),
+            )
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].text, "home, no mention")
+
+    def test_gateway_slash_command_in_home_channel_is_not_context_wrapped(self):
+        adapter = self.make_adapter(
+            {
+                "channels": [],
+                "home_channel": "chat/~labbel/home",
+                "owner_ship": "~mug",
+                "context_messages": 5,
+            }
+        )
+        adapter._sse = FakeSSE(
+            payload={
+                "posts": {
+                    "170142": {
+                        "r-post": {
+                            "set": {
+                                "essay": {
+                                    "author": "~mug",
+                                    "sent": 900,
+                                    "content": [{"inline": ["previous context"]}],
+                                },
+                                "seal": {"id": "170142"},
+                            }
+                        }
+                    },
+                    "170143": {
+                        "r-post": {
+                            "set": {
+                                "essay": {
+                                    "author": "~mug",
+                                    "sent": 1000,
+                                    "content": [{"inline": ["/new"]}],
+                                },
+                                "seal": {"id": "170143"},
+                            }
+                        }
+                    },
+                }
+            }
+        )
+
+        events = asyncio.run(
+            self.dispatches(
+                adapter,
+                channel_event(
+                    "/new",
+                    author="~mug",
+                    nest="chat/~labbel/home",
+                    post_id="170143",
+                ),
+            )
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].text, "/new")
+
     def test_tlon_session_blocks_skill_management(self):
         with patch.dict(os.environ, {"HERMES_SESSION_PLATFORM": "tlon"}, clear=True):
             block = adapter_mod.block_tlon_session_tool(
