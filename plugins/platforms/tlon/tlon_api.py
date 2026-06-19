@@ -147,23 +147,9 @@ def _parse_non_negative_int(value: Any, default: int) -> int:
     return parsed if parsed >= 0 else default
 
 
-DA_UNIX_EPOCH = 170141184475152167957503069145530368
-
-
 def _format_da_from_unix_millis(value: float) -> str:
     dt = datetime.fromtimestamp(value / 1000.0, tz=timezone.utc)
     return f"~{dt.year}.{dt.month}.{dt.day}..{dt.hour:02d}.{dt.minute:02d}.{dt.second:02d}"
-
-
-def _format_urbit_da_decimal_from_unix_millis(value: int) -> str:
-    """Return the dotted decimal @da format Tlon v2 writ IDs use."""
-    da_value = DA_UNIX_EPOCH + (int(value) * (1 << 64)) // 1_000_000
-    text = str(da_value)
-    parts: list[str] = []
-    while text:
-        parts.append(text[-3:])
-        text = text[:-3]
-    return ".".join(reversed(parts))
 
 
 def _format_dr_seconds(seconds: int) -> str:
@@ -677,104 +663,16 @@ class TlonCLI:
         self._client_factory = client_factory or TlonSSEClient
 
     async def send_message(self, chat_id: str, text: str) -> TlonSendResult:
+        """Send ordinary Tlon messages through the pinned monorepo CLI.
+
+        Do not hand-roll chat-dm-action-2 / channel-action-2 payloads here. The
+        monorepo tlon CLI routes posts send through upstream @tloncorp/api send
+        logic, including @urbit/aura ID formatting and current Story/author
+        shapes. Keeping Hermes on the CLI path prevents the Python adapter from
+        drifting from Tlon's client/server payload contract.
+        """
         target = str(chat_id or "").strip()
-        normalized = normalize_ship(target)
-        if normalized == target and normalized.startswith("~"):
-            return await self._send_dm_message(normalized, text)
-        nest = parse_channel_nest(target)
-        if nest is not None and nest.get("type") == "chat":
-            return await self._send_chat_channel_message(target, text)
-        return await self._run(("posts", "send", chat_id, text))
-
-    async def _send_chat_channel_message(self, chat_id: str, text: str) -> TlonSendResult:
-        sent_at = int(time.time() * 1000)
-        message_id = _format_urbit_da_decimal_from_unix_millis(sent_at)
-        payload = {
-            "channel": {
-                "nest": chat_id,
-                "action": {
-                    "post": {
-                        "add": {
-                            "content": [{"inline": [text]}],
-                            "sent": sent_at,
-                            "author": self.config.ship_name,
-                            "kind": "/chat",
-                            "meta": None,
-                            "blob": None,
-                        }
-                    }
-                },
-            }
-        }
-        command = ("http", "channel-action-2", chat_id)
-        client = self._client_factory(self.config)
-        try:
-            await client.authenticate()
-            await client.open()
-            await client.poke("channels", "channel-action-2", payload)
-        except Exception as exc:
-            return TlonSendResult(
-                success=False,
-                command=command,
-                returncode=1,
-                error=f"Tlon channel send failed: {exc}",
-            )
-        finally:
-            try:
-                await client.close()
-            except Exception:
-                pass
-        return TlonSendResult(
-            success=True,
-            command=command,
-            message_id=message_id,
-        )
-
-    async def _send_dm_message(self, chat_id: str, text: str) -> TlonSendResult:
-        sent_at = int(time.time() * 1000)
-        message_id = f"{self.config.ship_name}/{_format_urbit_da_decimal_from_unix_millis(sent_at)}"
-        payload = {
-            "ship": chat_id,
-            "diff": {
-                "id": message_id,
-                "delta": {
-                    "add": {
-                        "essay": {
-                            "content": [{"inline": [text]}],
-                            "sent": sent_at,
-                            "author": self.config.ship_name,
-                            "kind": "/chat",
-                            "meta": None,
-                            "blob": None,
-                        },
-                        "time": None,
-                    }
-                },
-            },
-        }
-        command = ("http", "chat-dm-action-2", chat_id)
-        client = self._client_factory(self.config)
-        try:
-            await client.authenticate()
-            await client.open()
-            await client.poke("chat", "chat-dm-action-2", payload)
-        except Exception as exc:
-            return TlonSendResult(
-                success=False,
-                command=command,
-                returncode=1,
-                error=f"Tlon DM send failed: {exc}",
-            )
-        finally:
-            try:
-                await client.close()
-            except Exception:
-                pass
-        return TlonSendResult(
-            success=True,
-            command=command,
-            message_id=message_id,
-        )
+        return await self._run(("posts", "send", target, text))
 
     async def send_reply(
         self,

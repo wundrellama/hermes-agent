@@ -540,8 +540,8 @@ class FakeDmSendClient:
 
 
 class TlonCLITests(unittest.TestCase):
-    def test_send_message_to_dm_uses_chat_dm_action_2_http_poke(self):
-        fake_clients = []
+    def test_send_message_to_dm_uses_monorepo_tlon_cli(self):
+        calls = []
         cfg = tlon_api.TlonConfig.from_env(
             env={
                 "TLON_NODE_URL": "https://zod.tlon.network",
@@ -551,51 +551,25 @@ class TlonCLITests(unittest.TestCase):
             }
         )
 
-        def client_factory(client_cfg):
-            client = FakeDmSendClient(client_cfg)
-            fake_clients.append(client)
-            return client
+        async def runner(command, env, timeout):
+            calls.append((tuple(command), dict(env), timeout))
+            return tlon_api.TlonProcessResult(returncode=0, stdout="Message sent\n")
 
         async def run():
-            cli = tlon_api.TlonCLI(cfg, client_factory=client_factory)
-            with patch.object(tlon_api.time, "time", return_value=1781770387.0):
-                return await cli.send_message("~nec", "hello from gateway")
+            cli = tlon_api.TlonCLI(cfg, runner=runner)
+            return await cli.send_message("~nec", "hello from gateway")
 
         result = asyncio.run(run())
 
         self.assertTrue(result.success)
-        self.assertEqual(result.command, ("http", "chat-dm-action-2", "~nec"))
-        self.assertEqual(result.message_id, "~zod/170.141.184.508.020.030.284.606.493.453.967.163")
-        self.assertEqual(len(fake_clients), 1)
-        client = fake_clients[0]
-        self.assertTrue(client.authenticated)
-        self.assertTrue(client.opened)
-        self.assertTrue(client.closed)
-        self.assertEqual(len(client.pokes), 1)
-        app, mark, payload = client.pokes[0]
-        self.assertEqual(app, "chat")
-        self.assertEqual(mark, "chat-dm-action-2")
-        self.assertEqual(payload["ship"], "~nec")
-        self.assertEqual(payload["diff"]["id"], result.message_id)
-        self.assertEqual(
-            payload["diff"]["delta"],
-            {
-                "add": {
-                    "essay": {
-                        "content": [{"inline": ["hello from gateway"]}],
-                        "sent": 1781770387000,
-                        "author": "~zod",
-                        "kind": "/chat",
-                        "meta": None,
-                        "blob": None,
-                    },
-                    "time": None,
-                }
-            },
-        )
+        self.assertEqual(calls[0][0], ("tlon-test", "posts", "send", "~nec", "hello from gateway"))
+        self.assertEqual(result.command, calls[0][0])
+        self.assertEqual(calls[0][1]["TLON_NODE_URL"], "https://zod.tlon.network")
+        self.assertEqual(calls[0][1]["TLON_NODE_ID"], "~zod")
+        self.assertEqual(calls[0][1]["TLON_ACCESS_CODE"], "code")
 
-    def test_send_message_to_chat_channel_uses_channel_action_http_poke(self):
-        fake_clients = []
+    def test_send_message_to_chat_channel_uses_monorepo_tlon_cli(self):
+        calls = []
         cfg = tlon_api.TlonConfig.from_env(
             env={
                 "TLON_NODE_URL": "https://zod.tlon.network",
@@ -605,50 +579,22 @@ class TlonCLITests(unittest.TestCase):
             }
         )
 
-        def client_factory(client_cfg):
-            client = FakeDmSendClient(client_cfg)
-            fake_clients.append(client)
-            return client
+        async def runner(command, env, timeout):
+            calls.append((tuple(command), dict(env), timeout))
+            return tlon_api.TlonProcessResult(returncode=0, stdout="Message sent\n")
 
         async def run():
-            cli = tlon_api.TlonCLI(cfg, client_factory=client_factory)
-            with patch.object(tlon_api.time, "time", return_value=1781770387.0):
-                return await cli.send_message("chat/~zod/general", "hello home channel")
+            cli = tlon_api.TlonCLI(cfg, runner=runner)
+            return await cli.send_message("chat/~zod/general", "hello home channel")
 
         result = asyncio.run(run())
 
         self.assertTrue(result.success)
-        self.assertEqual(result.command, ("http", "channel-action-2", "chat/~zod/general"))
-        self.assertEqual(result.message_id, "170.141.184.508.020.030.284.606.493.453.967.163")
-        self.assertEqual(len(fake_clients), 1)
-        client = fake_clients[0]
-        self.assertTrue(client.authenticated)
-        self.assertTrue(client.opened)
-        self.assertTrue(client.closed)
-        self.assertEqual(len(client.pokes), 1)
-        app, mark, payload = client.pokes[0]
-        self.assertEqual(app, "channels")
-        self.assertEqual(mark, "channel-action-2")
         self.assertEqual(
-            payload,
-            {
-                "channel": {
-                    "nest": "chat/~zod/general",
-                    "action": {
-                        "post": {
-                            "add": {
-                                "content": [{"inline": ["hello home channel"]}],
-                                "sent": 1781770387000,
-                                "author": "~zod",
-                                "kind": "/chat",
-                                "meta": None,
-                                "blob": None,
-                            }
-                        }
-                    },
-                }
-            },
+            calls[0][0],
+            ("tlon-test", "posts", "send", "chat/~zod/general", "hello home channel"),
         )
+        self.assertEqual(result.command, calls[0][0])
 
     def test_send_reply_uses_tlon_cli(self):
         calls = []
